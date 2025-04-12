@@ -1184,7 +1184,6 @@ dependencies = [
  "eframe",
  "egui_plot",
  "image 0.24.9",
- "jni",
  "rfd",
  "serde",
  "serde_json",

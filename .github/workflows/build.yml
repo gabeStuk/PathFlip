@@ -15,8 +15,9 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
-    - name: Get Version
+    - name: Get Version + Set Target
       run: |
+        rustup target add x86_64-pc-windows-gnu
         grep '^version' ${{github.workspace}}/Cargo.toml | awk -F\" '{print $2}' | xargs -I {} echo "version=v{}" >> $GITHUB_ENV
     - name: Build
       run: cargo build --verbose --release
