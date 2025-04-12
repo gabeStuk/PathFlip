@@ -7,6 +7,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  WIN_EXE_OUTPUT: ${{ github.workspace }}/target/x86_64-pc-windows-gnu/release/fldmirr.exe
 
 jobs:
   build:
@@ -27,7 +28,7 @@ jobs:
       uses: actions/upload-artifact@v4.6.2
       with:
         name: PathFlip-Windows
-        path: ${{ github.workspace }}/target/x86_64-pc-windows-gnu/release/fldmirr.exe
+        path: ${{env.WIN_EXE_OUTPUT}}
     - name: Create Release
       id: create_release
       uses: actions/create-release@v1
@@ -46,5 +47,5 @@ jobs:
       with:
         upload_url: ${{steps.create_release.outputs.upload_url}}
         asset_name: PathFlip.exe
-        asset_path: ${{ github.workspace }}/target/release/fldmirr.exe
+        asset_path: ${{env.WIN_EXE_OUTPUT}}
         asset_content_type: application/vnd.microsoft.portable-executable
