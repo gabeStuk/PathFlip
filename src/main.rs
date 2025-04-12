@@ -552,7 +552,7 @@ fn choreo_plot(
             )
         })
         .collect::<Vec<_>>();
-    let img = image::io::Reader::new(std::io::Cursor::new(include_bytes!("images\\field.png")))
+    let img = image::io::Reader::new(std::io::Cursor::new(include_bytes!("images/field.png")))
         .with_guessed_format()?
         .decode()
         .unwrap();
