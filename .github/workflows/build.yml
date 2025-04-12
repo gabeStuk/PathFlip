@@ -19,8 +19,10 @@ jobs:
       run: |
         rustup target add x86_64-pc-windows-gnu
         grep '^version' ${{github.workspace}}/Cargo.toml | awk -F\" '{print $2}' | xargs -I {} echo "version=v{}" >> $GITHUB_ENV
+        sudo apt update
+        sudo apt install gcc-mingw-w64
     - name: Build
-      run: cargo build --verbose --release --target "x86_64-pc-windows-gnu"
+      run: cargo build --verbose --release --target x86_64-pc-windows-gnu
     - name: Add artifact
       uses: actions/upload-artifact@v4.6.2
       with:
