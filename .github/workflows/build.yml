@@ -21,7 +21,7 @@ jobs:
     - name: Build
       run: cargo build --verbose --release
     - name: Add artifact
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4.6.2
       with:
         name: PathFlip-Windows
         path: ${{ github.workspace }}/target/release/fldmirr.exe
