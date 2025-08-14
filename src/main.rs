@@ -25,7 +25,7 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Choreo Path Flipper",
         opts,
-        Box::new(|cc| Ok(Box::new(CFlip::new(cc)))),
+        Box::new(|_| Ok(Box::new(CFlip::new()))),
     )
 }
 
@@ -39,7 +39,6 @@ struct CFlip {
     path_is_chor_traj: bool,
     robot_x_m: f64,
     robot_y_m: f64,
-    store_state: bool,
     robot_x_m_exp: String,
     robot_y_m_exp: String,
     units_is_imp: bool,
@@ -65,7 +64,6 @@ impl Default for CFlip {
             robot_y_m_exp: "0.889".to_string(),
             modal_open: false,
             units_is_imp: false,
-            store_state: true,
             outputname_valid: false,
             use_curr_dir: true,
             dir_prefx: "C:\\".to_string(),
@@ -83,22 +81,12 @@ impl Default for CFlip {
 }
 
 impl CFlip {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        if let Some(storage) = cc.storage {
-            return eframe::get_value(storage, eframe::APP_KEY).unwrap_or_default();
-        }
-
+    pub fn new() -> Self {
         Default::default()
     }
 }
 
 impl eframe::App for CFlip {
-    fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        if !self.store_state {
-            *self = CFlip::default();
-        }
-        eframe::set_value(storage, eframe::APP_KEY, self);
-    }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let col = egui::Color32::from_rgb(
@@ -113,7 +101,6 @@ impl eframe::App for CFlip {
                 .movable(false)
                 .open(&mut self.modal_open)
                 .show(ctx, |ui| {
-                    ui.checkbox(&mut self.store_state, "Save app state on exit");
                     let mut x_color = egui::Color32::RED;
                     let mut y_color = egui::Color32::RED;
                     if let Ok(x) = self.robot_x_m_exp.parse::<f64>() {
