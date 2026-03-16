@@ -1,16 +1,16 @@
 [package]
 name = "fldmirr"
 authors = ["sponge2"]
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 
 [dependencies]
 serde_json={version = "1.0", features = ["preserve_order"]}
 serde={version = "1.0.219", features = ["derive"]}
-eframe={version = "0.31.1", features = [
+eframe={version = "0.33.3", features = [
     "glow",
     "persistence",
 ]}
-egui_plot="0.32.1"
-rfd="0.15.3"
-image={version = "0.24", features = ["png"]}
+egui_plot="0.34.1"
+rfd="0.17.2"
+image={version = "0.25.10", features = ["png"]}

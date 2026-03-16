@@ -436,7 +436,7 @@ fn drop_file_preview(ctx: &egui::Context) {
         let painter =
             ctx.layer_painter(LayerId::new(Order::Foreground, Id::new("file_drop_target")));
 
-        let screen_rect = ctx.screen_rect();
+        let screen_rect = ctx.content_rect();
         painter.rect_filled(screen_rect, 0.0, Color32::from_black_alpha(192));
         painter.text(
             screen_rect.center(),
@@ -570,7 +570,7 @@ fn choreo_plot(
         Color32::GRAY.b(),
         25_u8,
     );
-    let img = image::io::Reader::new(std::io::Cursor::new(include_bytes!("images/field.png")))
+    let img = image::ImageReader::new(std::io::Cursor::new(include_bytes!("images/field.png")))
         .with_guessed_format()?
         .decode()
         .unwrap();
