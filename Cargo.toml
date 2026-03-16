@@ -14,3 +14,4 @@ eframe={version = "0.33.3", features = [
 egui_plot="0.34.1"
 rfd="0.17.2"
 image={version = "0.25.10", features = ["png"]}
+walkdir="2.5.0"

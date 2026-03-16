@@ -1,17 +1,27 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use eframe::egui::{self, Color32, ColorImage, Frame, RichText};
-use egui_plot::{Line, PlotImage, PlotPoint};
-use lib::chor::chor;
+use eframe::egui::{self, DroppedFile, Frame, RichText};
+use lib::chor;
+use lib::flip;
+use lib::pathplanner;
+use std::ffi::OsStr;
 use std::{
-    f32::consts::FRAC_PI_2,
     fs::File,
-    io::{Result, Write},
+    io::{Result},
     path::{Path, PathBuf},
+};
+use walkdir::{DirEntry, WalkDir};
+
+use crate::lib::{
+    plot::{self, Plotter},
 };
 
 mod lib {
     pub mod chor;
+    pub mod flip;
+    pub mod pathplanner;
+    pub mod plot;
+    pub mod util;
 }
 
 fn main() -> eframe::Result {
@@ -25,23 +35,78 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Choreo Path Flipper",
         opts,
-        Box::new(|_| Ok(Box::new(CFlip::new()))),
+        Box::new(|_| Ok(Box::new(PathFlip::new()))),
     )
 }
 
-struct CFlip {
+#[derive(Clone, Copy, PartialEq)]
+enum FlipFileType {
+    Choreo,
+    Pathplanner,
+    PathplannerAuto { is_chor: bool },
+}
+
+impl FlipFileType {
+    pub fn get_ext(&self) -> String {
+        return match self {
+            Self::Choreo => String::from("traj"),
+            Self::Pathplanner => String::from("path"),
+            Self::PathplannerAuto { is_chor: _ } => String::from("auto"),
+        };
+    }
+
+    pub fn check_file(&self, f: &File) -> bool {
+        match self {
+            Self::Choreo => {
+                let parsed: serde_json::Result<chor::ChoreoData> = serde_json::from_reader(f);
+                match parsed {
+                    Ok(_) => true,
+                    Err(err) => {
+                        println!("{}", err);
+                        false
+                    }
+                }
+            }
+            Self::Pathplanner => {
+                let parsed: serde_json::Result<pathplanner::path::PathData> =
+                    serde_json::from_reader(f);
+                match parsed {
+                    Ok(_) => true,
+                    Err(err) => {
+                        println!("{}", err);
+                        false
+                    }
+                }
+            }
+            Self::PathplannerAuto { is_chor: _ } => {
+                let parsed: serde_json::Result<pathplanner::auto::AutoData> =
+                    serde_json::from_reader(f);
+                match parsed {
+                    Ok(_) => true,
+                    Err(err) => {
+                        println!("{}", err);
+                        false
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct PathFlip {
     dropped_files: Vec<egui::DroppedFile>,
+    auto_files: Vec<PathBuf>,
+    auto_file_names: Vec<String>,
+    auto_file_prefs: Vec<String>,
+    auto_file_valids: Vec<bool>,
     picked_path: Option<String>,
     flip_same_alliance: bool,
     outputname: String,
     recalc_path: bool,
     outputname_valid: bool,
-    path_is_chor_traj: bool,
-    velocities: Vec<f64>,
-    sample_segs: Vec<Vec<[f64; 2]>>,
-    sample_mirr_segs: Vec<Vec<[f64; 2]>>,
-    wp_squares: Vec<Vec<[f64; 2]>>,
-    wp_mirr_squares: Vec<Vec<[f64; 2]>>,
+    path_is_valid_file: bool,
+    path_type: FlipFileType,
+    plotter: plot::DualPlotter,
     robot_x_m: f64,
     robot_y_m: f64,
     robot_x_m_exp: String,
@@ -55,24 +120,25 @@ struct CFlip {
     chassis_color: [u8; 3],
 }
 
-impl Default for CFlip {
+impl Default for PathFlip {
     fn default() -> Self {
         Self {
             dropped_files: Default::default(),
+            auto_files: Vec::new(),
+            auto_file_names: Vec::new(),
+            auto_file_prefs: Vec::new(),
+            auto_file_valids: Vec::new(),
             picked_path: Default::default(),
             flip_same_alliance: true,
             outputname: Default::default(),
+            path_type: FlipFileType::Choreo,
             recalc_path: false,
-            path_is_chor_traj: false,
+            path_is_valid_file: false,
+            plotter: Default::default(),
             robot_x_m: 0.889,
             robot_y_m: 0.889,
             robot_x_m_exp: "0.889".to_string(),
             robot_y_m_exp: "0.889".to_string(),
-            velocities: Vec::new(),
-            sample_segs: Vec::new(),
-            sample_mirr_segs: Vec::new(),
-            wp_squares: Vec::new(),
-            wp_mirr_squares: Vec::new(),
             modal_open: false,
             units_is_imp: false,
             outputname_valid: false,
@@ -91,13 +157,74 @@ impl Default for CFlip {
     }
 }
 
-impl CFlip {
+impl PathFlip {
     pub fn new() -> Self {
         Default::default()
     }
+
+    pub fn load_file(&mut self, path: &PathBuf) {
+        let path_str = path.display().to_string();
+        self.picked_path = Some(path_str);
+        self.path_is_valid_file = false;
+        if let Some(picked_path) = &self.picked_path {
+            let ext = path.extension().unwrap_or(OsStr::new(""));
+            if ext
+                == (FlipFileType::PathplannerAuto { is_chor: false })
+                    .get_ext()
+                    .as_str()
+            {
+                self.picked_path = Some(path.display().to_string());
+                self.path_is_valid_file = false;
+                if let Some(parent) = path.parent() {
+                    if let Ok(file) = File::open(&path) {
+                        if let Ok(data) =
+                            serde_json::from_reader::<&File, pathplanner::auto::AutoData>(&file)
+                        {
+                            let names = data.get_filenames();
+                            let path = if names.1 {
+                                parent
+                                    .parent()
+                                    .unwrap() // autos -> pathplanner
+                                    .parent()
+                                    .unwrap() // pathplanner -> deploy
+                                    .join("choreo")
+                            } else {
+                                parent
+                                    .parent()
+                                    .unwrap() // autos -> pathplanner
+                                    .join("paths")
+                            };
+                            self.auto_files.clear();
+                            self.auto_files
+                                .extend(names.0.iter().map(|s| PathBuf::from(path.join(s))));
+                            self.auto_file_prefs =
+                                self.auto_files.iter().map(|_| String::new()).collect();
+                            self.auto_file_names =
+                                self.auto_files.iter().map(|_| String::new()).collect();
+                            self.auto_file_valids = self.auto_files.iter().map(|_| false).collect();
+                            self.path_type = FlipFileType::PathplannerAuto { is_chor: names.1 };
+                            self.path_is_valid_file = true;
+                            self.recalc_path = true;
+                        }
+                    }
+                }
+            } else {
+                if let Ok(file) = File::open(picked_path) {
+                    for i in [FlipFileType::Choreo, FlipFileType::Pathplanner] {
+                        if i.get_ext().as_str() == ext && i.check_file(&file) {
+                            self.path_is_valid_file = true;
+                            self.recalc_path = true;
+                            self.path_type = i;
+                            self.auto_files.clear();
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
-impl eframe::App for CFlip {
+impl eframe::App for PathFlip {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let col = egui::Color32::from_rgb(
             self.chassis_color[0],
@@ -184,7 +311,7 @@ impl eframe::App for CFlip {
                 ui.group(|ui| {
                     ui.label("Dropped files:");
 
-                    for file in &self.dropped_files {
+                    for file in self.dropped_files.clone() {
                         let mut info = if let Some(path) = &file.path {
                             path.display().to_string()
                         } else if !file.name.is_empty() {
@@ -207,20 +334,7 @@ impl eframe::App for CFlip {
 
                         if ui.button(info).clicked() {
                             if let Some(path) = &file.path {
-                                self.picked_path = Some(path.display().to_string());
-                                self.path_is_chor_traj = false;
-                                if let Some(picked_path) = &self.picked_path {
-                                    if let Ok(file) = File::open(picked_path) {
-                                        if let Ok(_) =
-                                            serde_json::from_reader::<&File, chor::ChoreoData>(
-                                                &file,
-                                            )
-                                        {
-                                            self.path_is_chor_traj = true;
-                                            self.recalc_path = true;
-                                        }
-                                    }
-                                }
+                                self.load_file(path);
                             }
                         }
                     }
@@ -234,25 +348,22 @@ impl eframe::App for CFlip {
             ui.horizontal(|ui| {
                 if ui.button("Open file…").clicked() {
                     if let Some(path) = rfd::FileDialog::new().pick_file() {
-                        self.picked_path = Some(path.display().to_string());
-                        self.path_is_chor_traj = false;
-                        if let Some(picked_path) = &self.picked_path {
-                            if let Ok(file) = File::open(picked_path) {
-                                if let Ok(_) =
-                                    serde_json::from_reader::<&File, chor::ChoreoData>(&file)
-                                {
-                                    self.path_is_chor_traj = true;
-                                    self.recalc_path = true;
-                                }
-                            }
-                        }
+                        self.load_file(&path);
+                    }
+                }
+
+                if ui.button("Open folder...").clicked() {
+                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                        self.dropped_files
+                            .extend(collect_files(&path, &["auto", "path", "traj"]));
                     }
                 }
 
                 if self.picked_path.is_some() {
                     if ui.button("Close File").clicked() {
                         self.picked_path = None;
-                        self.path_is_chor_traj = false;
+                        self.path_is_valid_file = false;
+                        self.auto_files.clear();
                         self.outputname.clear();
                         self.outputname_valid = false;
                         self.write_status.clear();
@@ -267,7 +378,7 @@ impl eframe::App for CFlip {
                 ui.horizontal(|ui| {
                     ui.label("Selected file:");
                     ui.label(RichText::new(picked_path).monospace().color(
-                        if self.path_is_chor_traj {
+                        if self.path_is_valid_file {
                             egui::Color32::GREEN
                         } else {
                             egui::Color32::RED
@@ -289,34 +400,82 @@ impl eframe::App for CFlip {
                 &mut self.use_curr_dir,
                 "Use Selected Path Directory for output",
             );
-            let outputnamelabel = ui.label("Output file name");
-            ui.horizontal(|ui| {
-                if let Some(picked_p) = &self.picked_path {
-                    if self.use_curr_dir {
-                        self.dir_prefx = PathBuf::from(picked_p)
-                            .parent()
-                            .unwrap()
-                            .display()
-                            .to_string()
-                            + "\\";
-                    } else {
-                        self.dir_prefx = "C:\\".to_string();
-                    }
-                    ui.label(&self.dir_prefx);
+            if let Some(picked_p) = &self.picked_path {
+                let outputnamelabel = ui.label(format!(
+                    "Output file name -- {}",
+                    PathBuf::from(picked_p)
+                        .file_name()
+                        .unwrap()
+                        .display()
+                        .to_string()
+                ));
+                if self.use_curr_dir {
+                    self.dir_prefx = PathBuf::from(picked_p)
+                        .parent()
+                        .unwrap()
+                        .display()
+                        .to_string()
+                        + "\\";
+                } else {
+                    self.dir_prefx = "C:\\".to_string();
                 }
-                ui.add_enabled(
-                    self.path_is_chor_traj && self.picked_path.is_some(),
-                    egui::TextEdit::singleline(&mut self.outputname).background_color(
-                        if self.outputname_valid {
-                            egui::Visuals::dark().extreme_bg_color
+                ui.horizontal(|ui| {
+                    ui.label(&self.dir_prefx);
+                    ui.add_enabled(
+                        self.path_is_valid_file && self.picked_path.is_some(),
+                        egui::TextEdit::singleline(&mut self.outputname).background_color(
+                            if self.outputname_valid {
+                                egui::Visuals::dark().extreme_bg_color
+                            } else {
+                                egui::Color32::DARK_RED
+                            },
+                        ),
+                    )
+                    .labelled_by(outputnamelabel.id);
+                    ui.label(".".to_string() + &self.path_type.get_ext());
+                });
+                if let FlipFileType::PathplannerAuto {
+                    is_chor: is_chorchor,
+                } = self.path_type
+                {
+                    for i in 0..self.auto_files.len() {
+                        let sublabelname = ui.label(format!(
+                            "Path {} -- {}",
+                            i + 1,
+                            self.auto_files[i]
+                                .file_name()
+                                .unwrap()
+                                .display()
+                                .to_string()
+                        ));
+                        if self.use_curr_dir {
+                            self.auto_file_prefs[i] =
+                                self.auto_files[i].parent().unwrap().display().to_string() + "\\";
                         } else {
-                            egui::Color32::DARK_RED
-                        },
-                    ),
-                )
-                .labelled_by(outputnamelabel.id);
-                ui.label(".traj");
-            });
+                            self.auto_file_prefs[i] = "C:\\".to_string();
+                        }
+                        self.auto_file_valids[i] = outputfile_valid_list(
+                            &self.auto_file_names[i],
+                            &self.auto_files[i].display().to_string(),
+                            &self.auto_file_names[0..i],
+                        );
+                        ui.horizontal(|ui| {
+                            ui.label(&self.auto_file_prefs[i]);
+                            ui.add_enabled(
+                                self.path_is_valid_file && self.picked_path.is_some(),
+                                egui::TextEdit::singleline(&mut self.auto_file_names[i])
+                                    .background_color(if self.auto_file_valids[i] {
+                                        egui::Visuals::dark().extreme_bg_color
+                                    } else {
+                                        egui::Color32::DARK_RED
+                                    }),
+                            )
+                            .labelled_by(sublabelname.id);
+                            ui.label(".".to_string() + if is_chorchor { "traj" } else { "path" });
+                        });
+                    }
+                }
+            }
             if !self.write_status.is_empty() {
                 ui.label(
                     RichText::new(&self.write_status)
@@ -328,78 +487,52 @@ impl eframe::App for CFlip {
                         }),
                 );
             }
-            self.outputname_valid = !self.outputname.is_empty()
-                && !self
-                    .outputname
-                    .chars()
-                    .any(|c| matches!(c, '.' | '<' | '>' | ':' | '"' | '/' | '|' | '?' | '*'))
-                && !matches!(
-                    self.outputname.as_str(),
-                    "CON"
-                        | "PRN"
-                        | "AUX"
-                        | "NUL"
-                        | "COM1"
-                        | "COM2"
-                        | "COM3"
-                        | "COM4"
-                        | "COM5"
-                        | "COM6"
-                        | "COM7"
-                        | "COM8"
-                        | "COM9"
-                        | "LPT1"
-                        | "LPT2"
-                        | "LPT3"
-                        | "LPT4"
-                        | "LPT5"
-                        | "LPT6"
-                        | "LPT7"
-                        | "LPT8"
-                        | "LPT9"
-                );
+            self.outputname_valid = outputfile_valid(
+                &self.outputname,
+                self.picked_path.as_ref().unwrap_or(&String::new()),
+            );
             if let Some(path) = &self.picked_path {
-                if self.path_is_chor_traj && self.outputname_valid && !path.is_empty() {
+                if self.path_is_valid_file
+                    && self.outputname_valid
+                    && !path.is_empty()
+                    && (!matches!(
+                        self.path_type,
+                        FlipFileType::PathplannerAuto { is_chor: false }
+                            | FlipFileType::PathplannerAuto { is_chor: true }
+                    ) || self.auto_file_valids.iter().all(|b| *b))
+                {
                     if ui.button("Flip").clicked() {
                         let mut outputfile = PathBuf::from(&self.dir_prefx);
                         outputfile.push(&self.outputname);
-                        outputfile.set_extension("traj");
-                        if self.flip_same_alliance {
-                            let stat = flip_same_alliance(
-                                self.picked_path.as_ref().unwrap().to_owned(),
-                                outputfile.display().to_string(),
-                            );
-                            self.write_status = format!("{:?}", stat);
-                            self.write_err = stat.is_err();
-                        } else {
-                            let stat = flip_alliance(
-                                self.picked_path.as_ref().unwrap().to_owned(),
-                                outputfile.display().to_string(),
-                            );
-                            self.write_status = format!("{:?}", stat);
-                            self.write_err = stat.is_err();
-                        }
+                        outputfile.set_extension(self.path_type.get_ext());
+                        let stat = self.plotter.send_flip(
+                            self.picked_path.as_ref().unwrap().to_owned(),
+                            outputfile.display().to_string(),
+                            self.flip_same_alliance,
+                            Some(&self.auto_file_names),
+                        );
+                        self.write_status = format!("{:?}", stat);
+                        self.write_err = stat.is_err();
                     }
                 }
             }
             if let Some(picked_pth) = &mut self.picked_path {
-                if self.path_is_chor_traj {
+                if self.path_is_valid_file {
                     if self.recalc_path {
-                        choreo_plot_squares_make(
-                            picked_pth,
-                            self.robot_y_m,
-                            self.robot_x_m,
-                            &mut self.velocities,
-                            &mut self.sample_segs,
-                            &mut self.sample_mirr_segs,
-                            &mut self.wp_squares,
-                            &mut self.wp_mirr_squares,
-                            self.flip_same_alliance,
-                        )
-                        .unwrap();
+                        self.plotter.reset();
+                        self.plotter
+                            .set_plot_type(&self.path_type, self.auto_files.clone());
+                        self.plotter
+                            .gen(
+                                picked_pth,
+                                self.robot_y_m,
+                                self.robot_x_m,
+                                self.flip_same_alliance,
+                            )
+                            .unwrap();
                         self.recalc_path = false;
                     }
-                    choreo_plot(self, &col, ctx, ui).unwrap();
+                    self.plotter.plot(&col, ctx, ui).unwrap();
                 }
             }
         });
@@ -408,10 +541,104 @@ impl eframe::App for CFlip {
 
         ctx.input(|i| {
             if !i.raw.dropped_files.is_empty() {
-                self.dropped_files.clone_from(&i.raw.dropped_files);
+                self.dropped_files.extend(i.raw.dropped_files.clone());
             }
         });
     }
+}
+
+fn outputfile_valid(name: &String, inputname: &String) -> bool {
+    !name.is_empty()
+        && name != inputname
+        && !name
+            .chars()
+            .any(|c| matches!(c, '.' | '<' | '>' | ':' | '"' | '/' | '|' | '?' | '*'))
+        && !matches!(
+            name.as_str(),
+            "CON"
+                | "PRN"
+                | "AUX"
+                | "NUL"
+                | "COM1"
+                | "COM2"
+                | "COM3"
+                | "COM4"
+                | "COM5"
+                | "COM6"
+                | "COM7"
+                | "COM8"
+                | "COM9"
+                | "LPT1"
+                | "LPT2"
+                | "LPT3"
+                | "LPT4"
+                | "LPT5"
+                | "LPT6"
+                | "LPT7"
+                | "LPT8"
+                | "LPT9"
+        )
+}
+
+fn outputfile_valid_list(name: &String, inputname: &String, last_names: &[String]) -> bool {
+    !name.is_empty()
+        && inputname != name
+        && !last_names.contains(name)
+        && !name
+            .chars()
+            .any(|c| matches!(c, '.' | '<' | '>' | ':' | '"' | '/' | '|' | '?' | '*'))
+        && !matches!(
+            name.as_str(),
+            "CON"
+                | "PRN"
+                | "AUX"
+                | "NUL"
+                | "COM1"
+                | "COM2"
+                | "COM3"
+                | "COM4"
+                | "COM5"
+                | "COM6"
+                | "COM7"
+                | "COM8"
+                | "COM9"
+                | "LPT1"
+                | "LPT2"
+                | "LPT3"
+                | "LPT4"
+                | "LPT5"
+                | "LPT6"
+                | "LPT7"
+                | "LPT8"
+                | "LPT9"
+        )
+}
+
+fn collect_files(folder: &Path, extensions: &[&str]) -> Vec<DroppedFile> {
+    let paths = WalkDir::new(folder)
+        .into_iter()
+        .filter_map(|d| Result::ok(Ok(d.ok()?)))
+        .filter(|entry| entry.file_type().is_file())
+        .filter(|entry| {
+            if let Some(ext) = entry.path().extension() {
+                let ext = ext.to_string_lossy().to_lowercase();
+                extensions.iter().any(|e| e == &ext)
+            } else {
+                false
+            }
+        })
+        .map(|entry: DirEntry| entry.path().to_path_buf())
+        .collect::<Vec<std::path::PathBuf>>();
+    paths
+        .into_iter()
+        .map(|path| DroppedFile {
+            path: Some(path),
+            name: String::new(),
+            mime: String::new(),
+            last_modified: Option::None,
+            bytes: None,
+        })
+        .collect()
 }
 
 fn drop_file_preview(ctx: &egui::Context) {
@@ -445,362 +672,5 @@ fn drop_file_preview(ctx: &egui::Context) {
             TextStyle::Heading.resolve(&ctx.style()),
             Color32::WHITE,
         );
-    }
-}
-
-fn color_lerp(low: egui::Color32, high: egui::Color32, t: f64) -> egui::Color32 {
-    let t = t.clamp(0.0, 1.0);
-    egui::Color32::from_rgb(
-        (low.r() as f64 * (1.0 - t) + high.r() as f64 * t) as u8,
-        (low.g() as f64 * (1.0 - t) + high.g() as f64 * t) as u8,
-        (low.b() as f64 * (1.0 - t) + high.b() as f64 * t) as u8,
-    )
-}
-
-fn choreo_plot_squares_make(
-    filepath: &String,
-    r_ym: f64,
-    r_xm: f64,
-    velocities: &mut Vec<f64>,
-    sample_segs_geom: &mut Vec<Vec<[f64; 2]>>,
-    sample_mirror_segs_geom: &mut Vec<Vec<[f64; 2]>>,
-    wp_squares_geom: &mut Vec<Vec<[f64; 2]>>,
-    wp_mirr_squares_geom: &mut Vec<Vec<[f64; 2]>>,
-    same_alli: bool,
-) -> Result<()> {
-    use std::fs::File;
-
-    let file = File::open(filepath)?;
-    let data: chor::ChoreoData = serde_json::from_reader(&file)?;
-    let samples = &data.trajectory.samples;
-    let waypoints = &data.params.waypoints;
-
-    // Clear old geometry
-    sample_segs_geom.clear();
-    sample_mirror_segs_geom.clear();
-    wp_squares_geom.clear();
-    wp_mirr_squares_geom.clear();
-
-    // --- Sample segments ---
-    for pair in samples.windows(2) {
-        let s0 = &pair[0];
-        let s1 = &pair[1];
-        sample_segs_geom.push(vec![[s0.x as f64, s0.y as f64], [s1.x as f64, s1.y as f64]]);
-    }
-
-    *velocities = samples
-        .iter()
-        .map(|s| (s.vx * s.vx + s.vy * s.vy).sqrt())
-        .collect();
-
-    // --- Mirrored sample segments ---
-    let mirr_func = if same_alli {
-        chor::flip_xaxis
-    } else {
-        chor::flip_yaxis
-    };
-    let mirr_cs = if same_alli {
-        chor::ChoreoSample::flip_same_alliance
-    } else {
-        chor::ChoreoSample::flip_alliance
-    };
-
-    for i in 0..samples.len() - 1 {
-        let mut smp_window = [samples[i].clone(), samples[i + 1].clone()];
-        smp_window.iter_mut().for_each(mirr_cs);
-        sample_mirror_segs_geom.push(vec![
-            [smp_window[0].x, smp_window[0].y],
-            [smp_window[1].x, smp_window[1].y],
-        ]);
-    }
-
-    // --- Waypoints ---
-    let wps: Vec<(PlotPoint, f64)> = waypoints
-        .iter()
-        .map(|wp| {
-            (
-                PlotPoint::from([wp.x.val as f64, wp.y.val as f64]),
-                wp.heading.val as f64,
-            )
-        })
-        .collect();
-
-    let mirred_wps: Vec<(PlotPoint, f64)> = wps
-        .iter()
-        .map(|wp| (PlotPoint::from(mirr_func(wp.0.x, wp.0.y)), -wp.1))
-        .collect();
-
-    for (_i, p) in wps.iter().enumerate() {
-        wp_squares_geom.push(draw_rotate_square_rect(
-            [p.0.x, p.0.y],
-            r_ym,
-            r_xm,
-            p.1 - FRAC_PI_2 as f64,
-        ));
-    }
-
-    for (_i, p) in mirred_wps.iter().enumerate() {
-        wp_mirr_squares_geom.push(draw_rotate_square_rect(
-            [p.0.x, p.0.y],
-            r_ym,
-            r_xm,
-            p.1 + FRAC_PI_2 as f64,
-        ));
-    }
-
-    Ok(())
-}
-
-fn choreo_plot(
-    _self: &mut CFlip,
-    col: &Color32,
-    ctx: &egui::Context,
-    ui: &mut egui::Ui,
-) -> Result<()> {
-    use egui_plot::Plot;
-    let gray_blend2 = Color32::from_rgba_unmultiplied(
-        Color32::GRAY.r(),
-        Color32::GRAY.g(),
-        Color32::GRAY.b(),
-        150_u8,
-    );
-    let gray_blend = Color32::from_rgba_unmultiplied(
-        Color32::GRAY.r(),
-        Color32::GRAY.g(),
-        Color32::GRAY.b(),
-        25_u8,
-    );
-    let img = image::ImageReader::new(std::io::Cursor::new(include_bytes!("images/field.png")))
-        .with_guessed_format()?
-        .decode()
-        .unwrap();
-    let size = [img.width() as usize, img.height() as usize];
-    let img_buff = img.to_rgba8();
-    let pix = img_buff.as_flat_samples();
-    Plot::new("Choreo Path")
-        .view_aspect((chor::FIELD_X / chor::FIELD_Y) as f32)
-        .data_aspect(1.0)
-        .cursor_color(Color32::WHITE)
-        .show(ui, |plot_ui| {
-            plot_ui.ctx().style_mut(|f| {
-                f.visuals.override_text_color = Some(egui::Color32::WHITE);
-            });
-            plot_ui.image(
-                PlotImage::new(
-                    "bg",
-                    ctx.load_texture(
-                        "bg_img",
-                        ColorImage::from_rgba_unmultiplied(size, pix.as_slice()),
-                        Default::default(),
-                    )
-                    .id(),
-                    PlotPoint::new(chor::FIELD_X / 2.0, chor::FIELD_Y / 2.0),
-                    [chor::FIELD_X as f32, chor::FIELD_Y as f32],
-                )
-                .tint(gray_blend2),
-            );
-            for pts in &_self.wp_squares {
-                plot_ui.line(
-                    Line::new("wp_square", pts.clone())
-                        .color(*col)
-                        .style(egui_plot::LineStyle::Solid)
-                        .fill((pts.iter().map(|p| p[1]).sum::<f64>() / pts.len() as f64) as f32)
-                        .width(4.0),
-                );
-            }
-            for pts in &_self.wp_mirr_squares {
-                plot_ui.line(
-                    Line::new("wp_mirr_square", pts.clone())
-                        .color(col.blend(gray_blend))
-                        .style(egui_plot::LineStyle::dashed_dense())
-                        .fill((pts.iter().map(|p| p[1]).sum::<f64>() / pts.len() as f64) as f32)
-                        .width(4.0),
-                );
-            }
-            let mut sample_colors: Vec<Color32> = Vec::new();
-            let min_vel = _self
-                .velocities
-                .iter()
-                .cloned()
-                .fold(f64::INFINITY, f64::min);
-            let max_vel = _self
-                .velocities
-                .iter()
-                .cloned()
-                .fold(f64::NEG_INFINITY, f64::max);
-            let range = (max_vel - min_vel).max(0.01);
-            for (i, pts) in _self.sample_segs.iter().enumerate() {
-                let avg_vel = (_self.velocities[i] + _self.velocities[i + 1]) / 2.0;
-                let t = (avg_vel - min_vel) / range;
-                let color = color_lerp(
-                    egui::Color32::RED,
-                    egui::Color32::GREEN.blend(gray_blend),
-                    t,
-                );
-                plot_ui.line(Line::new("sample", pts.clone()).color(color).width(4.0));
-                sample_colors.push(color);
-            }
-            for (i, pts) in _self.sample_mirr_segs.iter().enumerate() {
-                plot_ui.line(
-                    Line::new("sample_mirror", pts.clone())
-                        .color(sample_colors[i].blend(gray_blend2))
-                        .width(4.0),
-                );
-            }
-        });
-    Ok(())
-}
-
-fn draw_rotate_square_rect(center: [f64; 2], width: f64, height: f64, angle: f64) -> Vec<[f64; 2]> {
-    // Compute the half-width and half-height for easier calculations
-    let half_width = width / 2.0;
-    let half_height = height / 2.0;
-
-    // Define the four corners of the rectangle relative to the center
-    let corners = (0..4)
-        .map(|i| {
-            let (dx, dy) = match i {
-                0 => (half_width, half_height),   // Top-right
-                1 => (-half_width, half_height),  // Top-left
-                2 => (-half_width, -half_height), // Bottom-left
-                _ => (half_width, -half_height),  // Bottom-right
-            };
-
-            // Apply the rotation matrix
-            let rotated_x = center[0] + dx * angle.cos() - dy * angle.sin();
-            let rotated_y = center[1] + dx * angle.sin() + dy * angle.cos();
-
-            [rotated_x, rotated_y]
-        })
-        .collect::<Vec<[f64; 2]>>(); // Collect points into a vector of f64 arrays
-
-    // Ensure that the shape is closed by adding the first point at the end
-    let mut closed_corners = corners.clone();
-    closed_corners.push(corners[0]);
-
-    return closed_corners;
-}
-
-fn flip_same_alliance(inputfile: String, outputfile: String) -> Result<()> {
-    let mut file = File::open(inputfile)?;
-    let mut file_out = File::create(outputfile.clone())?;
-    let mut data: chor::ChoreoData = serde_json::from_reader(&mut file)?;
-    data.snapshot
-        .waypoints
-        .iter_mut()
-        .for_each(chor::ChoreoSWaypoint::flip_same_alliance);
-    data.params
-        .waypoints
-        .iter_mut()
-        .for_each(chor::ChoreoWaypoint::flip_same_alliance);
-    data.trajectory
-        .samples
-        .iter_mut()
-        .for_each(chor::ChoreoSample::flip_same_alliance);
-    data.name = String::from(
-        Path::new(&outputfile)
-            .file_stem()
-            .and_then(|f| f.to_str())
-            .unwrap_or(""),
-    );
-    let new_val = serde_json::to_value(data)?;
-    file_out.write_all(
-        format_custom(&new_val, false, 0)
-            .replace(": ", ":")
-            .as_bytes(),
-    )?;
-    Ok(())
-}
-
-fn flip_alliance(inputfile: String, outputfile: String) -> Result<()> {
-    let mut file = File::open(inputfile)?;
-    let mut file_out = File::create(outputfile.clone())?;
-    let mut data: chor::ChoreoData = serde_json::from_reader(&mut file)?;
-    data.snapshot
-        .waypoints
-        .iter_mut()
-        .for_each(chor::ChoreoSWaypoint::flip_alliance);
-    data.params
-        .waypoints
-        .iter_mut()
-        .for_each(chor::ChoreoWaypoint::flip_alliance);
-    data.trajectory
-        .samples
-        .iter_mut()
-        .for_each(chor::ChoreoSample::flip_alliance);
-    data.name = String::from(
-        Path::new(&outputfile)
-            .file_stem()
-            .and_then(|f| f.to_str())
-            .unwrap_or(""),
-    );
-    let new_val = serde_json::to_value(data)?;
-    file_out.write_all(
-        format_custom(&new_val, false, 0)
-            .replace(": ", ":")
-            .as_bytes(),
-    )?;
-    Ok(())
-}
-
-fn format_custom(value: &serde_json::Value, in_array: bool, indent: usize) -> String {
-    match value {
-        serde_json::Value::Object(map) => {
-            if in_array {
-                let entries = map
-                    .iter()
-                    .map(|(k, v)| format!("\"{}\": {}", k, format_custom(v, true, indent)))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("{{{}}}", entries)
-            } else {
-                let indent_str = " ".repeat(indent);
-                let inner_indent_str = " ".repeat(indent + 1);
-                let entries = map
-                    .iter()
-                    .map(|(k, v)| {
-                        format!(
-                            "{}\"{}\": {}",
-                            inner_indent_str,
-                            k,
-                            format_custom(v, false, indent + 1)
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(",\n");
-                format!("{{\n{}\n{}}}", entries, indent_str)
-            }
-        }
-        serde_json::Value::Array(arr) => {
-            if in_array {
-                let items: Vec<String> =
-                    arr.iter().map(|v| format_custom(v, true, indent)).collect();
-                format!("[{}]", items.join(","))
-            } else {
-                let inner_indent_str = "  ".repeat(indent);
-                let all_prim: bool = arr.iter().all(|f| {
-                    matches!(
-                        f,
-                        serde_json::Value::Null
-                            | serde_json::Value::Bool(_)
-                            | serde_json::Value::Number(_)
-                            | serde_json::Value::String(_)
-                    )
-                });
-                let entries = arr
-                    .iter()
-                    .map(|v| {
-                        format!(
-                            "{}{}",
-                            if all_prim { "" } else { &inner_indent_str },
-                            format_custom(v, true, indent + 1)
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(if all_prim { "," } else { ",\n" });
-                format!("[{}{}]", if all_prim { "" } else { "\n" }, entries)
-            }
-        }
-        _ => value.to_string(),
     }
 }
