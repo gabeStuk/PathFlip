@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use eframe::egui::{self, Color32, ColorImage, Frame, RichText};
-use egui_plot::{Line, LineStyle, PlotImage, PlotItem, PlotPoint};
+use egui_plot::{Line, PlotImage, PlotPoint};
 use lib::chor::chor;
 use std::{
     f32::consts::FRAC_PI_2,
@@ -29,14 +29,19 @@ fn main() -> eframe::Result {
     )
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
 struct CFlip {
     dropped_files: Vec<egui::DroppedFile>,
     picked_path: Option<String>,
     flip_same_alliance: bool,
     outputname: String,
+    recalc_path: bool,
     outputname_valid: bool,
     path_is_chor_traj: bool,
+    velocities: Vec<f64>,
+    sample_segs: Vec<Vec<[f64; 2]>>,
+    sample_mirr_segs: Vec<Vec<[f64; 2]>>,
+    wp_squares: Vec<Vec<[f64; 2]>>,
+    wp_mirr_squares: Vec<Vec<[f64; 2]>>,
     robot_x_m: f64,
     robot_y_m: f64,
     robot_x_m_exp: String,
@@ -57,11 +62,17 @@ impl Default for CFlip {
             picked_path: Default::default(),
             flip_same_alliance: true,
             outputname: Default::default(),
+            recalc_path: false,
             path_is_chor_traj: false,
             robot_x_m: 0.889,
             robot_y_m: 0.889,
             robot_x_m_exp: "0.889".to_string(),
             robot_y_m_exp: "0.889".to_string(),
+            velocities: Vec::new(),
+            sample_segs: Vec::new(),
+            sample_mirr_segs: Vec::new(),
+            wp_squares: Vec::new(),
+            wp_mirr_squares: Vec::new(),
             modal_open: false,
             units_is_imp: false,
             outputname_valid: false,
@@ -87,7 +98,6 @@ impl CFlip {
 }
 
 impl eframe::App for CFlip {
-
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let col = egui::Color32::from_rgb(
             self.chassis_color[0],
@@ -184,6 +194,7 @@ impl eframe::App for CFlip {
                         };
 
                         let mut additional_info = vec![];
+
                         if !file.mime.is_empty() {
                             additional_info.push(format!("type: {}", file.mime));
                         }
@@ -197,6 +208,19 @@ impl eframe::App for CFlip {
                         if ui.button(info).clicked() {
                             if let Some(path) = &file.path {
                                 self.picked_path = Some(path.display().to_string());
+                                self.path_is_chor_traj = false;
+                                if let Some(picked_path) = &self.picked_path {
+                                    if let Ok(file) = File::open(picked_path) {
+                                        if let Ok(_) =
+                                            serde_json::from_reader::<&File, chor::ChoreoData>(
+                                                &file,
+                                            )
+                                        {
+                                            self.path_is_chor_traj = true;
+                                            self.recalc_path = true;
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -218,6 +242,7 @@ impl eframe::App for CFlip {
                                     serde_json::from_reader::<&File, chor::ChoreoData>(&file)
                                 {
                                     self.path_is_chor_traj = true;
+                                    self.recalc_path = true;
                                 }
                             }
                         }
@@ -251,10 +276,15 @@ impl eframe::App for CFlip {
                 });
             }
 
-            ui.checkbox(
-                &mut self.flip_same_alliance,
-                "Flip across the X axis (same alliance right/left)",
-            );
+            if ui
+                .checkbox(
+                    &mut self.flip_same_alliance,
+                    "Flip across the Y axis (same alliance right/left)",
+                )
+                .changed()
+            {
+                self.recalc_path = true;
+            }
             ui.checkbox(
                 &mut self.use_curr_dir,
                 "Use Selected Path Directory for output",
@@ -352,9 +382,24 @@ impl eframe::App for CFlip {
                     }
                 }
             }
-            if let Some(picked_pth) = &self.picked_path {
+            if let Some(picked_pth) = &mut self.picked_path {
                 if self.path_is_chor_traj {
-                    choreo_plot(&self, &col, ctx, ui, picked_pth, self.flip_same_alliance).unwrap();
+                    if self.recalc_path {
+                        choreo_plot_squares_make(
+                            picked_pth,
+                            self.robot_y_m,
+                            self.robot_x_m,
+                            &mut self.velocities,
+                            &mut self.sample_segs,
+                            &mut self.sample_mirr_segs,
+                            &mut self.wp_squares,
+                            &mut self.wp_mirr_squares,
+                            self.flip_same_alliance,
+                        )
+                        .unwrap();
+                        self.recalc_path = false;
+                    }
+                    choreo_plot(self, &col, ctx, ui).unwrap();
                 }
             }
         });
@@ -412,60 +457,43 @@ fn color_lerp(low: egui::Color32, high: egui::Color32, t: f64) -> egui::Color32 
     )
 }
 
-fn choreo_plot(
-    _self: &CFlip,
-    col: &egui::Color32,
-    ctx: &egui::Context,
-    ui: &mut egui::Ui,
+fn choreo_plot_squares_make(
     filepath: &String,
+    r_ym: f64,
+    r_xm: f64,
+    velocities: &mut Vec<f64>,
+    sample_segs_geom: &mut Vec<Vec<[f64; 2]>>,
+    sample_mirror_segs_geom: &mut Vec<Vec<[f64; 2]>>,
+    wp_squares_geom: &mut Vec<Vec<[f64; 2]>>,
+    wp_mirr_squares_geom: &mut Vec<Vec<[f64; 2]>>,
     same_alli: bool,
 ) -> Result<()> {
-    use egui_plot::{Line, Plot};
+    use std::fs::File;
+
     let file = File::open(filepath)?;
     let data: chor::ChoreoData = serde_json::from_reader(&file)?;
-    let gray_blend = Color32::from_rgba_unmultiplied(
-        Color32::GRAY.r(),
-        Color32::GRAY.g(),
-        Color32::GRAY.b(),
-        50_u8,
-    );
-    let gray_blend2 = Color32::from_rgba_unmultiplied(
-        Color32::GRAY.r(),
-        Color32::GRAY.g(),
-        Color32::GRAY.b(),
-        150_u8,
-    );
     let samples = &data.trajectory.samples;
     let waypoints = &data.params.waypoints;
-    let min_vel = samples
-        .iter()
-        .map(|s| (s.vx * s.vx + s.vy * s.vy).sqrt())
-        .fold(f64::INFINITY, f64::min);
-    let max_vel = samples
-        .iter()
-        .map(|s| (s.vx * s.vx + s.vy * s.vy).sqrt())
-        .fold(f64::NEG_INFINITY, f64::max);
-    let range = (max_vel - min_vel).max(0.01);
-    let mut sample_segs: Vec<Line> = Vec::new();
-    for (i, pair) in samples.windows(2).enumerate() {
+
+    // Clear old geometry
+    sample_segs_geom.clear();
+    sample_mirror_segs_geom.clear();
+    wp_squares_geom.clear();
+    wp_mirr_squares_geom.clear();
+
+    // --- Sample segments ---
+    for pair in samples.windows(2) {
         let s0 = &pair[0];
         let s1 = &pair[1];
-        let avg_vel =
-            ((s0.vx * s0.vx + s0.vy * s0.vy).sqrt() + (s1.vx * s1.vx + s1.vy * s1.vy).sqrt()) / 2.0;
-        let t = (avg_vel - min_vel) / range;
-        let color = color_lerp(
-            egui::Color32::RED,
-            egui::Color32::GREEN.blend(gray_blend),
-            t,
-        );
-        let line = Line::new(
-            format!("Sample Line {}", i),
-            vec![[s0.x as f64, s0.y as f64], [s1.x as f64, s1.y as f64]],
-        )
-        .color(color)
-        .highlight(true);
-        sample_segs.push(line);
+        sample_segs_geom.push(vec![[s0.x as f64, s0.y as f64], [s1.x as f64, s1.y as f64]]);
     }
+
+    *velocities = samples
+        .iter()
+        .map(|s| (s.vx * s.vx + s.vy * s.vy).sqrt())
+        .collect();
+
+    // --- Mirrored sample segments ---
     let mirr_func = if same_alli {
         chor::flip_xaxis
     } else {
@@ -476,27 +504,18 @@ fn choreo_plot(
     } else {
         chor::ChoreoSample::flip_alliance
     };
-    let sample_mirr_segs = sample_segs
-        .iter()
-        .enumerate()
-        .map(|(i, s)| {
-            let mut smp_window = [
-                samples.get(i).unwrap().to_owned(),
-                samples.get(i + 1).unwrap().to_owned(),
-            ];
-            smp_window.iter_mut().for_each(mirr_cs);
-            Line::new(
-                format!("Mirrored Sample Line {}", i),
-                vec![
-                    [smp_window[0].x, smp_window[0].y],
-                    [smp_window[1].x, smp_window[1].y],
-                ],
-            )
-            .color(s.color().blend(gray_blend).blend(gray_blend))
-            .highlight(true)
-        })
-        .collect::<Vec<_>>();
-    let wps = waypoints
+
+    for i in 0..samples.len() - 1 {
+        let mut smp_window = [samples[i].clone(), samples[i + 1].clone()];
+        smp_window.iter_mut().for_each(mirr_cs);
+        sample_mirror_segs_geom.push(vec![
+            [smp_window[0].x, smp_window[0].y],
+            [smp_window[1].x, smp_window[1].y],
+        ]);
+    }
+
+    // --- Waypoints ---
+    let wps: Vec<(PlotPoint, f64)> = waypoints
         .iter()
         .map(|wp| {
             (
@@ -504,41 +523,53 @@ fn choreo_plot(
                 wp.heading.val as f64,
             )
         })
-        .collect::<Vec<_>>();
-    let mirred_wps = wps
+        .collect();
+
+    let mirred_wps: Vec<(PlotPoint, f64)> = wps
         .iter()
         .map(|wp| (PlotPoint::from(mirr_func(wp.0.x, wp.0.y)), -wp.1))
-        .collect::<Vec<_>>();
-    let wp_squares = wps
-        .iter()
-        .enumerate()
-        .map(|(i, p)| {
-            draw_rotate_square_rect(
-                &p.0,
-                _self.robot_y_m,
-                _self.robot_x_m,
-                *col,
-                p.1 - FRAC_PI_2 as f64,
-                false,
-                (i + 1).to_string(),
-            )
-        })
-        .collect::<Vec<_>>();
-    let wp_mirr_squares = mirred_wps
-        .iter()
-        .enumerate()
-        .map(|(i, p)| {
-            draw_rotate_square_rect(
-                &p.0,
-                _self.robot_y_m,
-                _self.robot_x_m,
-                col.blend(gray_blend),
-                p.1 + FRAC_PI_2 as f64,
-                true,
-                "m".to_string() + (i + 1).to_string().as_str(),
-            )
-        })
-        .collect::<Vec<_>>();
+        .collect();
+
+    for (_i, p) in wps.iter().enumerate() {
+        wp_squares_geom.push(draw_rotate_square_rect(
+            [p.0.x, p.0.y],
+            r_ym,
+            r_xm,
+            p.1 - FRAC_PI_2 as f64,
+        ));
+    }
+
+    for (_i, p) in mirred_wps.iter().enumerate() {
+        wp_mirr_squares_geom.push(draw_rotate_square_rect(
+            [p.0.x, p.0.y],
+            r_ym,
+            r_xm,
+            p.1 + FRAC_PI_2 as f64,
+        ));
+    }
+
+    Ok(())
+}
+
+fn choreo_plot(
+    _self: &mut CFlip,
+    col: &Color32,
+    ctx: &egui::Context,
+    ui: &mut egui::Ui,
+) -> Result<()> {
+    use egui_plot::Plot;
+    let gray_blend2 = Color32::from_rgba_unmultiplied(
+        Color32::GRAY.r(),
+        Color32::GRAY.g(),
+        Color32::GRAY.b(),
+        150_u8,
+    );
+    let gray_blend = Color32::from_rgba_unmultiplied(
+        Color32::GRAY.r(),
+        Color32::GRAY.g(),
+        Color32::GRAY.b(),
+        25_u8,
+    );
     let img = image::io::Reader::new(std::io::Cursor::new(include_bytes!("images/field.png")))
         .with_guessed_format()?
         .decode()
@@ -568,31 +599,59 @@ fn choreo_plot(
                 )
                 .tint(gray_blend2),
             );
-            for line in wp_squares {
-                plot_ui.line(line);
+            for pts in &_self.wp_squares {
+                plot_ui.line(
+                    Line::new("wp_square", pts.clone())
+                        .color(*col)
+                        .style(egui_plot::LineStyle::Solid)
+                        .fill((pts.iter().map(|p| p[1]).sum::<f64>() / pts.len() as f64) as f32)
+                        .width(4.0),
+                );
             }
-            for line in wp_mirr_squares {
-                plot_ui.line(line);
+            for pts in &_self.wp_mirr_squares {
+                plot_ui.line(
+                    Line::new("wp_mirr_square", pts.clone())
+                        .color(col.blend(gray_blend))
+                        .style(egui_plot::LineStyle::dashed_dense())
+                        .fill((pts.iter().map(|p| p[1]).sum::<f64>() / pts.len() as f64) as f32)
+                        .width(4.0),
+                );
             }
-            for line in sample_segs {
-                plot_ui.line(line);
+            let mut sample_colors: Vec<Color32> = Vec::new();
+            let min_vel = _self
+                .velocities
+                .iter()
+                .cloned()
+                .fold(f64::INFINITY, f64::min);
+            let max_vel = _self
+                .velocities
+                .iter()
+                .cloned()
+                .fold(f64::NEG_INFINITY, f64::max);
+            let range = (max_vel - min_vel).max(0.01);
+            for (i, pts) in _self.sample_segs.iter().enumerate() {
+                let avg_vel = (_self.velocities[i] + _self.velocities[i + 1]) / 2.0;
+                let t = (avg_vel - min_vel) / range;
+                let color = color_lerp(
+                    egui::Color32::RED,
+                    egui::Color32::GREEN.blend(gray_blend),
+                    t,
+                );
+                plot_ui.line(Line::new("sample", pts.clone()).color(color).width(4.0));
+                sample_colors.push(color);
             }
-            for line in sample_mirr_segs {
-                plot_ui.line(line);
+            for (i, pts) in _self.sample_mirr_segs.iter().enumerate() {
+                plot_ui.line(
+                    Line::new("sample_mirror", pts.clone())
+                        .color(sample_colors[i].blend(gray_blend2))
+                        .width(4.0),
+                );
             }
         });
     Ok(())
 }
 
-fn draw_rotate_square_rect(
-    center: &PlotPoint,
-    width: f64,
-    height: f64,
-    color: egui::Color32,
-    angle: f64,
-    mirrored: bool,
-    name: String,
-) -> Line {
+fn draw_rotate_square_rect(center: [f64; 2], width: f64, height: f64, angle: f64) -> Vec<[f64; 2]> {
     // Compute the half-width and half-height for easier calculations
     let half_width = width / 2.0;
     let half_height = height / 2.0;
@@ -608,8 +667,8 @@ fn draw_rotate_square_rect(
             };
 
             // Apply the rotation matrix
-            let rotated_x = center.x + dx * angle.cos() - dy * angle.sin();
-            let rotated_y = center.y + dx * angle.sin() + dy * angle.cos();
+            let rotated_x = center[0] + dx * angle.cos() - dy * angle.sin();
+            let rotated_y = center[1] + dx * angle.sin() + dy * angle.cos();
 
             [rotated_x, rotated_y]
         })
@@ -619,15 +678,7 @@ fn draw_rotate_square_rect(
     let mut closed_corners = corners.clone();
     closed_corners.push(corners[0]);
 
-    Line::new(name, closed_corners)
-        .color(color)
-        .style(if mirrored {
-            LineStyle::dashed_dense()
-        } else {
-            LineStyle::Solid
-        })
-        .fill(center.y as f32)
-        .width(if mirrored { 4.0 } else { 4.0 })
+    return closed_corners;
 }
 
 fn flip_same_alliance(inputfile: String, outputfile: String) -> Result<()> {

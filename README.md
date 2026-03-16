@@ -1,3 +1,3 @@
 # PathFlip
-This program is currently VERY unoptimized
-(not redrawing entire app every frame TODO)
+
+Choreo and (TODO maybe pathplanner?) utility to flip paths to automate the creation of left and right side autons.
